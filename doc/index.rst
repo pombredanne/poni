@@ -31,6 +31,7 @@ Contents
 .. toctree::
    :maxdepth: 2
 
+   overview
    changes
    getting-started
    properties
@@ -38,6 +39,7 @@ Contents
    template-variables
    plugins
    ec2
+   vsphere
    remote
    vc
    examples/puppet

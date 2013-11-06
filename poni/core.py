@@ -1,11 +1,12 @@
 """
 core logic
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
 
+import os
 import re
 import sys
 import imp
@@ -29,7 +30,10 @@ SETTINGS_DIR = "settings"
 DONT_SHOW = set(["cloud"])
 DONT_SAVE = set(["index", "sub_count", "depth"])
 
-g_plugin_counter = 0
+g_plugin_module_cache = {}
+g_plugin_cache = {}
+g_cache_reset_counter = 0
+
 
 def ensure_dir(typename, root, name, must_exist):
     """validate dir 'name' under 'root': dir either 'must_exist' or not"""
@@ -190,7 +194,7 @@ class Config(Item):
         return "%s/%s" % (self.node.name, self.name)
 
     full_path = property(get_full_path, doc="get full config path")
-    full_name = full_path # backward compatibility
+    full_name = full_path  # backward compatibility
 
     def __hash__(self):
         return hash(self.full_name)
@@ -257,16 +261,28 @@ class Config(Item):
             # no plugin, nothing to verify
             return
 
-        # use a unique module name when importing the plugin
-        global g_plugin_counter
-        module = imp.load_source("_poni_plugin_%r" % g_plugin_counter,
-                                 plugin_path)
-        g_plugin_counter += 1
+        plugin_key = (manager, self, node, top_config)
+        plugin = g_plugin_cache.get(plugin_key)
+        if plugin:
+            return plugin
+
+        cache_key = (plugin_path, os.stat(plugin_path).st_mtime)
+        module = g_plugin_module_cache.get(cache_key)
+        if not module:
+            # reload the plugin module only if it is not in cache or it has
+            # been modified
+            # use a unique module name when importing the plugin
+            module = imp.load_source(
+                "_poni_plugin_%r" % len(g_plugin_module_cache),
+                plugin_path)
+
+            g_plugin_module_cache[cache_key] = module
 
         plugin = module.PlugIn(manager, self, node, top_config)
         plugin.add_actions()
         plugin.add_all_controls()
-        top_config.plugin = plugin # TODO
+        top_config.plugin = plugin  # TODO
+        g_plugin_cache[plugin_key] = plugin
 
     def collect_parents(self, manager, node, top_config=None):
         top_config = top_config or self
@@ -367,7 +383,15 @@ class Node(Item):
 
         settings_dir = config_dir / SETTINGS_DIR
         if not settings_dir.exists():
-            settings_dir.mkdir() # pre-created so it is there for copying files
+            settings_dir.mkdir()  # pre-created so it is there for copying files
+
+    def remove_config(self, config):
+        config_dir = self.path / CONFIG_DIR / config
+        if not config_dir.exists():
+            raise errors.UserError(
+                "%s: config %r doest not exist" % (self.name, config))
+
+        shutil.rmtree(config_dir)
 
     def iter_configs(self):
         config_dir = self.path / CONFIG_DIR
@@ -435,11 +459,29 @@ class ConfigMan:
         self.system_root = self.root_dir / "system"
         self.config_path = self.root_dir / REPO_CONF_FILE
         self.node_cache = {}
+        self.find_cache = {}
+        self.find_config_cache = {}
+        self._cache_reset_counter = g_cache_reset_counter
         if must_exist:
             conf = self.load_config()
             self.apply_library_paths(conf.get("libpath", {}))
 
         self.vc = vc.create_vc(self.root_dir)
+
+    def dump_stats(self):
+        return dict(
+            node_cache=len(self.node_cache),
+            find_cache=len(self.find_cache),
+            find_config_cache=len(self.find_config_cache),
+            )
+
+    def reset_cache(self):
+        self.node_cache = {}
+        self.find_cache = {}
+        self.find_config_cache = {}
+        global g_cache_reset_counter
+        g_cache_reset_counter += 1
+        self._cache_reset_counter = g_cache_reset_counter
 
     def apply_library_paths(self, path_dict):
         """add repo's custom library include paths to sys.path"""
@@ -448,7 +490,9 @@ class ConfigMan:
             if not lib_path.isabs():
                 lib_path = self.root_dir / lib_path
 
-            sys.path.append(lib_path)
+            lib_path = str(lib_path)
+            if not lib_path in sys.path:
+                sys.path.append(lib_path)
 
     def init_repo(self):
         if self.config_path.exists():
@@ -460,14 +504,55 @@ class ConfigMan:
                 self.system_root.makedirs()
 
             util.json_dump({}, self.config_path)
+            (self.root_dir / "poni.id").write_bytes("""
+            eJy1l7uOJCcUhvN5ipKQKkK1EogASKCSIiEiIbZlGSSvd3VYv7//Q1+2dy5yte09
+            0nRXMwUf5w7L8oNszpNcfpK83B6CcItc3PhZoBvMWQIMotfU339N+u3/gbl9W7bC
+            sFFrvQy/XVrK7b3hZ2Fx28iWVQDmhpFzRfdm3U067x0+3H+AyapHLR4LeeqDlN88
+            wxz5zTHikbdhB/6fDfrhCy/S2GrI0RhEPavgSXvnfFFaJmjpP5jq3OM4FKaij1pX
+            VZyUSi7vbullka2UPnrHH9UhRte99FJNowNx41mhH6dIIu9p6EbOd1NK0fueYjya
+            bYcIezoqfuDLtiRfw5aueleDVVNB29KtKqZgqMTqAZMTtj1YiI64tqZbjAkUPFal
+            qmKsMSbhyRgMaGuPdVVvYJRDKaCFYBXR3oAvvQkTqnSS7gaDE6Vjx83FldJaV9Vi
+            wHMxyrBxRh8qW2Xw0MGuFnspQ293mC+N475VXVwPjULIQiSdMZZJln41v5euIeu7
+            637AzlidFVGHTqwUrz56FYoqL3YQ0eSp2jyC/QarUYUp1vgjfBc9P6nXwcEut1GH
+            Wb0frcDsvG194FvZPhedXi86NHUIJFEQu6Ixx0xT29U4L8sWQ0jVxTsFo4lf5zlB
+            kKrG+YW8RKTV6RBjajz6KLYmA193A83Yy9A2zVl5fqqpXOdguyYnzDgVKyLdUeye
+            yw8hDq9EQSr26mcIQAdeNWJ/vbd917bqZieM/3NRiyfiW2jYBSoXpfw9QKjdtRLf
+            Qwdv5zXGXPduOB44AC4yxnGwR5NIU4898thQtVhxhYWU8WAI+zHDFK1uMOu3HuPc
+            zo9lWARhMc2wU64c+GuMojJv/SpBHJ0YhmjBj/267ZzTijqxBgGYOfwV1gJiKASk
+            9OuM97yByOtfSHBKRYrUZNcsMmQXOcJyUXOss4vUHRZEsghJ+IhrhFVXGAqgXDjX
+            6TVscZgUzdw407B33eroR2LUzri071AuM6wMVJaRxI2WE2C0VyTKKPoGu8k7LXoG
+            yiAOOuQrogMWDGysHah94qaO0LcnjTrmxl012BflNuzYJXn1GvaeyMu8RgNVA3Gg
+            bmGKAEhpv/BShq0L6qJB3RPfYRmQXXPR9cadgN2SANtURzR2TQ95j5DbAeS0ysNX
+            cY/F2xzjx/R48f2MZsvlwHCTqHR4JdALlhQZ/eVSBh7/qSMnN9ypTml2sSQ5eD7W
+            YsRr1oMc82wRiKP4QSqxz07CIBRWNHP0VFRZEff8FrTOUJYDbfTBGvmwR+RSit5x
+            GjaLpaHhx62ecXem7kuK9F5PpquuaIgcxIWegfFWsxrcFs69f1Pe5tDQzpXanoBN
+            Wveooh+cLF8LdLs0khwi12L/DAzRHTR7/k1R+0BqsJdoWhEh6OjbM5rtqxocbtd2
+            cWLGlD0oScMqbc/DtkAeR0ne6OnrwExMiQBGj+8luvOalUqD2DjHSafNphG694X9
+            ljpOPadhFLRinUI6ff6eMGwRsaKNoid8hjtVo/llTs+YMNB0xIHZPwOrppBfNCry
+            SdVmYo95phNo7/0ZmFJjkx3etieDf+WqzI1wkMCJ+ymYhhE3rqfq5DUYWcb9hWGt
+            OlxFzsN67rgOmn7q0nSfNOZJGSeRfY1qO51nm2/7yjeYs9f7gSJc5zETrVrhznA2
+            9GXhoKj2JGeKK56MXo+Ii1G/nKVO9rM+/u0NfuNWxPcxro0vd1z79u2r+/Tp9/6t
+            /fXL9uuXz58+//bHF/r09cuf/eXlb2jrYlE="""
+            .decode("base64").decode("zlib"))
         except (OSError, IOError), error:
             raise errors.RepoError("repository '%s' init failed: %s: %s" % (
                     self.root_dir, error.__class__.__name__, error))
 
     def set_library_path(self, name, lib_path):
         conf = self.load_config()
+        lib_path = str(lib_path)
         libpath = conf.setdefault("libpath", {})
+        old_path = libpath.get(name)
         libpath[name] = lib_path
+
+        # apply the path to sys.path
+        sys_lib_path = lib_path if path(lib_path).isabs() else (self.root_dir / lib_path)
+        if sys_lib_path not in sys.path:
+            sys.path.insert(0, sys_lib_path)
+
+        if old_path and old_path in sys.path:
+            sys.path.remove(old_path)
+
         self.save_config(conf)
 
     def load_config(self):
@@ -531,11 +616,20 @@ class ConfigMan:
         extra = extra or {}
         node = self.node_cache.get(node_path)
         if not node:
-            name = name or node_path[len(self.system_root)+1:]
+            name = name or node_path[len(self.system_root) + 1:]
             node = Node(self, system, name, node_path, extra=extra)
             self.node_cache[node_path] = node
 
         return node
+
+    def get_system(self, parent_system, name, current, level, extra):
+        key = ("system", parent_system, name, current, level, tuple(extra.items()))
+        system = self.node_cache.get(key)
+        if not system:
+            system = System(parent_system, name, current, level, extra=extra)
+            self.node_cache[key] = system
+
+        return system
 
     def get_config(self, pattern):
         configs = list(self.find_config(pattern, all_configs=True,
@@ -549,6 +643,15 @@ class ConfigMan:
         return configs[0]
 
     def find_config(self, pattern, all_configs=False, full_match=False):
+        key = (pattern, all_configs, full_match)
+        results = self.find_config_cache.get(key)
+        if not results:
+            results = list(self._find_config(pattern, all_configs=all_configs, full_match=full_match))
+            self.find_config_cache[key] = results
+
+        return results
+
+    def _find_config(self, pattern, all_configs=False, full_match=False):
         comparison = ConfigMatch(pattern, full_match=full_match)
         for node in self.find("."):
             if not comparison.match_node(node.name):
@@ -563,11 +666,27 @@ class ConfigMan:
                 if comparison.match_config(conf.name):
                     yield node, conf
 
-    def find(self, pattern, current=None, system=None, nodes=True,
+    def find(self, pattern, nodes=True,
+             systems=False, depth=None, full_match=False, exclude=None):
+        key = (pattern, nodes, systems, tuple(depth or []), full_match, tuple(exclude or []))
+        results = self.find_cache.get(key)
+        if not results:
+            results = list(self._find(pattern, nodes=nodes, systems=systems, depth=depth, full_match=full_match, exclude=exclude))
+            self.find_cache[key] = results
+
+        return results
+
+    def _find(self, pattern, current=None, system=None, nodes=True,
              systems=False, curr_depth=0, extra=None, depth=None,
-             full_match=False):
+             full_match=False, exclude=None):
         depth = depth or []
         extra = extra or {}
+        if not callable(exclude):
+            if exclude:
+                exclude = re.compile(exclude).search
+            else:
+                exclude = lambda name: False
+
         pattern = pattern or ""
 
         if isinstance(pattern, (str, unicode)):
@@ -579,28 +698,29 @@ class ConfigMan:
         match_op = pattern.match if full_match else pattern.search
         current = current or self.system_root
         node_conf_file = current / NODE_CONF_FILE
-        name = current[len(self.system_root)+1:]
+        name = current[len(self.system_root) + 1:]
         ok_depth = (not depth) or (curr_depth in depth)
 
         if node_conf_file.exists():
             # this is a node dir
-            if nodes and match_op(name) and ok_depth:
+            if nodes and match_op(name) and ok_depth and not exclude(name):
                 yield self.get_node(current, system, extra=extra)
         else:
             # system dir
             subdirs = current.dirs()
             subdirs.sort()
-            system = System(system, name, current, len(subdirs), extra=extra)
+            system = self.get_system(system, name, current, len(subdirs), extra)
             if (systems and (current != self.system_root) and ok_depth
-                and match_op(name)):
+                and match_op(name)) and not exclude(name):
                 yield system
 
             for sub_index, subdir in enumerate(subdirs):
                 sub_depth = curr_depth + 1
                 extra = dict(index=sub_index, depth=sub_depth)
 
-                for result in self.find(pattern, current=subdir, system=system,
-                                        nodes=nodes, systems=systems,
-                                        curr_depth=sub_depth, extra=extra,
-                                        depth=depth, full_match=full_match):
+                for result in self._find(pattern, current=subdir, system=system,
+                                         nodes=nodes, systems=systems,
+                                         curr_depth=sub_depth, extra=extra,
+                                         exclude=exclude,
+                                         depth=depth, full_match=full_match):
                     yield result

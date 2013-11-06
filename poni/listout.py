@@ -3,7 +3,7 @@ List output formatting
 
 TODO: messy, rewrite
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
@@ -20,9 +20,10 @@ class ListOutput(colors.Output):
                  pattern=False, full_match=False, show_node_prop=False,
                  show_cloud_prop=False, show_config_prop=False,
                  list_props=False, show_layers=False, color="auto",
-                 show_controls=False,
+                 show_controls=False, exclude=None,
                  query_status=False, show_settings=False, **kwargs):
         colors.Output.__init__(self, sys.stdout, color=color)
+        self.exclude = exclude or []
         self.show_nodes = show_nodes
         self.show_systems = show_systems
         self.show_config = show_config
@@ -152,6 +153,9 @@ class ListOutput(colors.Output):
             yield parent_name, "configparent"
             yield ")", None
 
+        if entry["inherited"]:
+            yield " [inherited]", None
+
     def format_unknown(self, entry):
         yield "UNKNOWN: %r" % entry["type"], "red"
 
@@ -162,7 +166,7 @@ class ListOutput(colors.Output):
 
     def output_pairs(self):
         for entry in self.iter_tree():
-            indent = (entry["item"]["depth"] - 1) * self.indent
+            indent = (entry["item"].get("depth", 0) - 1) * self.indent
             if entry["type"] not in ["system", "node", "config"]:
                 indent += self.hindent
 
@@ -190,7 +194,8 @@ class ListOutput(colors.Output):
         the output.
         """
         for item in self.confman.find(self.pattern, systems=self.show_systems,
-                                      full_match=self.full_match):
+                                      full_match=self.full_match,
+                                      exclude=self.exclude):
             if isinstance(item, core.Node):
                 if self.show_nodes:
                     yield dict(type="node", item=item)
@@ -207,10 +212,10 @@ class ListOutput(colors.Output):
                     yield dict(type="prop", item=item, prop=items)
 
             if isinstance(item, core.Node):
-                for conf in sorted(item.iter_configs(),
+                for conf in sorted(item.iter_all_configs(),
                                    key=lambda x: x.name):
                     if self.show_config:
-                        yield dict(type="config", item=item, config=conf)
+                        yield dict(type="config", item=item, config=conf, inherited=(conf.node != item))
 
                     if self.show_layers:
                         for i, (sort_key, layer_name, file_path) \

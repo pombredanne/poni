@@ -1,7 +1,7 @@
 """
 Remote node control using the Paramiko SSH library
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
@@ -27,6 +27,11 @@ try:
         import paramiko
 except AttributeError:
     import paramiko
+
+try:
+    from select import epoll
+except ImportError:
+    epoll = None
 
 
 def convert_paramiko_errors(method):
@@ -84,11 +89,11 @@ class ParamikoRemoteControl(rcontrol.SshRemoteControl):
         rcontrol.SshRemoteControl.__init__(self, node)
         self._ssh = None
         self._sftp = None
+        self.ping_interval = 10
 
     def get_sftp(self):
         if not self._sftp:
-            self._sftp = self.get_ssh().open_sftp()
-
+            self._sftp = self.get_ssh(lambda ssh: ssh.open_sftp())
         return self._sftp
 
     @convert_paramiko_errors
@@ -98,12 +103,20 @@ class ParamikoRemoteControl(rcontrol.SshRemoteControl):
         return sftp.file(file_path, mode="rb").read()
 
     @convert_paramiko_errors
-    def write_file(self, file_path, contents, mode=None):
+    def write_file(self, file_path, contents, mode=None, owner=None,
+                   group=None):
         file_path = str(file_path)
         sftp = self.get_sftp()
         f = sftp.file(file_path, mode="wb")
         if mode is not None:
             sftp.chmod(file_path, mode)
+
+        if (owner is not None) or (group is not None):
+            # set owner and group
+            file_stat = sftp.stat(file_path)
+            sftp.chown(file_path,
+                       owner if (owner is not None) else file_stat.st_uid,
+                       group if (group is not None) else file_stat.st_gid)
 
         f.write(contents)
         f.close()
@@ -117,12 +130,11 @@ class ParamikoRemoteControl(rcontrol.SshRemoteControl):
             self._ssh.close()
             self._ssh = None
 
-    def get_ssh(self):
-        if self._ssh:
-            return self._ssh
-
+    def get_ssh(self, action=None):
         host = self.node.get("host")
         user = self.node.get("user")
+        password = self.node.get("password")
+        port = int(self.node.get("ssh-port", os.environ.get("PONI_SSH_PORT", 22)))
 
         if not host:
             raise errors.RemoteError("%s: 'host' property not defined" % (
@@ -131,108 +143,124 @@ class ParamikoRemoteControl(rcontrol.SshRemoteControl):
             raise errors.RemoteError("%s: 'user' property not defined" % (
                 self.node.name))
 
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
         if self.key_filename:
-            # TODO: other dirs than ~/.ssh/
-            key_file = "%s/.ssh/%s" % (os.environ.get("HOME"),
-                                       self.key_filename)
+            key_file = self.key_filename
+            if not os.path.isabs(key_file):
+                key_file = "%s/.ssh/%s" % (os.environ.get("HOME"),
+                                           key_file)
         else:
             key_file = None
 
-        self.log.debug("ssh connect: host=%s, user=%s, key=%s",
-                       host, user, key_file)
+        self.log.debug("ssh connect: host=%s, port=%r, user=%s, key=%s",
+                       host, port, user, key_file)
 
         end_time = time.time() + self.connect_timeout
         while time.time() < end_time:
             try:
-                ssh.connect(host, username=user, key_filename=key_file)
-                self._ssh = ssh
-                return self._ssh
+                if not self._ssh:
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(host, port=port, username=user, key_filename=key_file, password=password)
+                    self._ssh = ssh
+                return action(self._ssh) if action else self._ssh
             except (socket.error, paramiko.SSHException), error:
                 remaining = max(0, end_time - time.time())
                 self.log.warning("%s: ssh connection to %s failed: %s: %s, "
                                  "retry time remaining=%.0fs" % (
                                  self.node.name, host,
                                  error.__class__.__name__, error, remaining))
-                time.sleep(5)
+                self._ssh = None
+                time.sleep(2.5)
 
         raise errors.RemoteError("%s: ssh connect failed: %s: %s" % (
                 self.node.name, error.__class__.__name__, error))
 
     @convert_paramiko_errors
-    def execute_command(self, cmd):
-        ssh = self.get_ssh()
-        transport = ssh.get_transport()
-        channel = transport.open_session()
+    def execute_command(self, cmd, pseudo_tty=False):
+        def get_channel(ssh):
+            channel = ssh.get_transport().open_session()
+            if not channel:
+                raise paramiko.SSHException("channel opening failed")
+            return channel
+        channel = self.get_ssh(get_channel)
+        if not channel:
+            raise errors.RemoteError("failed to open an SSH session to %s" % (
+                    self.node.name))
+        if pseudo_tty:
+            channel.get_pty()
+
         channel.set_combine_stderr(True) # TODO: separate stdout/stderr?
         BS = 2**16
         rx_time = time.time()
-        log_name = "%s: %r" % (self.node.name, cmd)
+        log_name = "%s (%s): %r" % (self.node.name, self.node.get("host"), cmd)
         next_warn = time.time() + self.warn_timeout
+        next_ping = time.time() + self.ping_interval
+
+        def available_output():
+            """read all the output that is immediately available"""
+            while channel.recv_ready():
+                chunk = channel.recv(BS)
+                yield rcontrol.STDOUT, chunk
+
+        channel.exec_command(cmd)
+        channel.shutdown_write()
+
+        exit_code = None
+        if epoll:
+            poll = select.epoll()
+            poll.register(channel.fileno(), select.EPOLLIN)
+        else:
+            poll = None
+
         try:
-            channel.exec_command(cmd)
-            channel.shutdown_write()
-            terminating = False
             while True:
-                if channel.exit_status_ready():
-                    if terminating:
-                        # process terminated AND remaining output is read
-                        break
-                    else:
-                        # one more round of reads to get the remaining output
-                        terminating = True
+                if (exit_code is None) and channel.exit_status_ready():
+                    # process has finished executing, but there still may be
+                    # output to read from stdout or stderr
+                    exit_code = channel.recv_exit_status()
 
-                if not terminating:
-                    r, w, e = select.select([channel], [], [], 1.0)
+                # wait for input, note that the results are not used for anything
+                if poll:
+                    poll.poll(timeout=1.0)  # just poll, not interested in the fileno
+                else:
+                    select.select([channel], [], [], 1.0)
 
-                while channel.recv_stderr_ready():
-                    x = channel.recv_stderr(BS)
+                for output in available_output():
                     rx_time = time.time()
                     next_warn = time.time() + self.warn_timeout
-                    if x:
-                        yield rcontrol.STDERR, x
+                    yield output
 
-                while channel.recv_ready():
-                    x = channel.recv(BS)
-                    rx_time = time.time()
-                    next_warn = time.time() + self.warn_timeout
-                    if x:
-                        yield rcontrol.STDOUT, x
+                if channel.closed and (exit_code is not None):
+                    yield rcontrol.DONE, exit_code
+                    break  # everything done!
 
                 now = time.time()
                 if now > (rx_time + self.terminate_timeout):
                     # no output in a long time, terminate connection
                     raise errors.RemoteError(
-                        "%s: no output in %.1s, terminating" % (
+                        "%s: no output in %.1f seconds, terminating" % (
                             log_name, self.terminate_timeout))
 
                 if now > next_warn:
+                    elapsed_since = time.time() - rx_time
                     self.log.warning("%s: no output in %.1fs", log_name,
-                                     self.warn_timeout)
+                                     elapsed_since)
                     next_warn = time.time() + self.warn_timeout
 
-            exit_code = channel.recv_exit_status()
+                if now > next_ping:
+                    channel.transport.send_ignore()
+                    next_ping = time.time() + self.ping_interval
         finally:
-            if channel:
-                pass
-                # experimental: channel.close() disabled temporarily due to the following resulting problem:
-#paramiko.transport      ERROR     File "/usr/lib/pymodules/python2.6/paramiko/pipe.py", line 66, in set
-#paramiko.transport      ERROR       os.write(self._wfd, '*')
-#paramiko.transport      ERROR   OSError: [Errno 32] Broken pipe
-
-                #channel.close()
-
-        yield rcontrol.DONE, exit_code
+            if poll:
+                poll.close()
 
     @convert_paramiko_errors
     def execute_shell(self):
-        ssh = self.get_ssh()
-        channel = None
+        def invoke_shell(ssh):
+            # TODO: get dimensions from `stty size` or something like that
+            return ssh.invoke_shell(term='vt100', width=80, height=24)
         try:
-            channel = ssh.invoke_shell(term='vt100',
-                                       width=80, height=24) # TODO: dimensions?
+            channel = self.get_ssh(invoke_shell)
             interactive_shell(channel)
         finally:
             if channel:

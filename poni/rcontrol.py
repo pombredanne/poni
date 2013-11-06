@@ -1,20 +1,21 @@
 """
 Remote controlling of nodes: copying files, executing commands
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
 
 from __future__ import with_statement
 
-import os
-import subprocess
-import logging
-import shutil
-import sys
-import select
 import errno
+import logging
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
 from . import errors
 from . import colors
 
@@ -28,13 +29,9 @@ class RemoteControl:
     def __init__(self, node):
         self.node = node
         self.warn_timeout = 30.0 # seconds to wait before warning user after receiving any output
-        self.terminate_timeout = 300.0 # seconds to wait before disconnecting after receiving any output
+        self.terminate_timeout = node.get_tree_property("control_timeout", 300.0) # seconds to wait before disconnecting after receiving any output
 
-    def tag_line(self, tag, command, result=None, verbose=False, color=None):
-        assert color
-        if not verbose:
-            return
-
+    def get_out_line(self, color, tag, command, result):
         desc = "%s (%s): %s" % (color(self.node.name, "node"),
                                 color(self.node.get("host"), "host"),
                                 color(command, "command"))
@@ -45,7 +42,19 @@ class RemoteControl:
                                       tag,
                                       desc,
                                       color("---", "header"))
-        sys.stdout.write(out_line)
+        return out_line
+
+    def tag_line(self, tag, command, result=None, verbose=False, color=None,
+                 out_file=None):
+        assert color
+        if out_file and not out_file.isatty():
+            no_color = self.get_color(None, out_file=out_file)
+            plain_out = self.get_out_line(no_color, tag, command, result)
+            out_file.write(plain_out)
+
+        if verbose:
+            color_out = self.get_out_line(color, tag, command, result)
+            sys.stdout.write(color_out)
 
     def get_color(self, color, out_file=None):
         out_file = out_file or sys.stdout
@@ -54,7 +63,9 @@ class RemoteControl:
         else:
             return colors.Output(out_file, color="no").color
 
-    def execute(self, command, verbose=False, color=None, output_lines=None, output_file=None, quiet=False):
+    def execute(self, command, verbose=False, color=None, output_lines=None,
+        output_file=None, quiet=False, exec_options=None):
+        exec_options = exec_options or {}
         if output_file is not None:
             stdout_file = output_file
             stderr_file = output_file
@@ -69,11 +80,13 @@ class RemoteControl:
         output_chunks = []
         color = self.get_color(color, out_file=stdout_file)
         self.tag_line(color("BEGIN", "header"), command, verbose=verbose,
-                      color=color)
+                      color=color, out_file=stdout_file)
 
+        start = time.time()
         try:
             while True:
-                for code, output in self.execute_command(command):
+                for code, output in self.execute_command(command,
+                        **exec_options):
                     if code == STDOUT:
                         if output_lines is not None:
                             output_chunks.append(output)
@@ -110,8 +123,9 @@ class RemoteControl:
                            "op_error")
             raise
         finally:
-            self.tag_line(color("END", "header"), command, result=result,
-                          verbose=verbose, color=color)
+            elapsed = time.time() - start
+            self.tag_line(color("END %.1fs" % elapsed, "header"), command, result=result,
+                          verbose=verbose, color=color, out_file=stdout_file)
 
     def shell(self, verbose=False, color=None):
         color = self.get_color(color)
@@ -133,10 +147,11 @@ class RemoteControl:
     def put_file(self, source_path, dest_path, callback=None):
         assert 0, "must implement in sub-class"
 
-    def write_file(self, file_path, contents, mode=None):
+    def write_file(self, file_path, contents, mode=None, owner=None,
+                   group=None):
         assert 0, "must implement in sub-class"
 
-    def execute_command(self, command):
+    def execute_command(self, command, pseudo_tty=False):
         assert 0, "must implement in sub-class"
 
     def execute_shell(self):
@@ -185,16 +200,24 @@ class LocalControl(RemoteControl):
         return file(file_path, "rb").read()
 
     @convert_local_errors
-    def write_file(self, file_path, contents, mode=None):
+    def write_file(self, file_path, contents, mode=None, owner=None,
+                   group=None):
         f = file(file_path, "wb")
         if mode is not None:
             os.chmod(file_path, mode)
+
+        if (owner is not None) or (group is not None):
+            # set owner and group
+            file_stat = os.stat(file_path)
+            os.chown(file_path,
+                     owner if (owner is not None) else file_stat.st_uid,
+                     group if (group is not None) else file_stat.st_gid)
 
         f.write(contents)
         f.close()
 
     @convert_local_errors
-    def execute_command(self, cmd):
+    def execute_command(self, cmd, pseudo_tty=False):
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
         fds = [process.stdout, process.stderr]
@@ -232,9 +255,11 @@ class SshRemoteControl(RemoteControl):
         self.log = logging.getLogger("ssh")
         RemoteControl.__init__(self, node)
         self.key_filename = None
-        cloud_key = node.get("cloud", {}).get("key-pair")
+        cloud_prop = node.get("cloud", {})
+        # renamed property name: backward-compatibility
+        cloud_key = cloud_prop.get("key_pair", cloud_prop.get("key-pair"))
         if cloud_key:
-            # cloud 'key-pair' overrides 'ssh-key' from host properties
+            # cloud 'key_pair' overrides 'ssh-key' from host properties
             self.key_filename = "%s.pem" % cloud_key
         else:
             self.key_filename = node.get_tree_property("ssh-key")

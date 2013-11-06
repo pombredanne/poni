@@ -52,15 +52,20 @@ NOTE: during installation the following packages and their dependencies are
 automatically installed from PyPI_:
 
 * `path.py`_ (directory and file management)
-* Cheetah_ (text-based templating language)
 * Argh_ (command-line argument parsing)
 
 Installing the following Python libraries will add optional functionality:
 
+* Cheetah_ (text-based templating language)
+* Genshi_ (XML-based templating language)
+* Mako_ (text-based templating language)
 * Paramiko_ (Remote node control using SSH)
 * GitPython_ (Version controlling the repository with Git)
 * Boto_ (`Amazon EC2`_ virtual machine provisioning)
-* Genshi_ (XML-based templating)
+* pyvsphere_ (VMWare virtual machine provisioning)
+* libvirt-python_ (libvirt virtual machine provisioning)
+* PyDNS_ (libvirt provisioning dependency)
+* lxml_ (libvirt provisioning dependency)
 
 .. _`Amazon EC2`: http://aws.amazon.com/ec2/
 .. _Paramiko: http://pypi.python.org/pypi/paramiko
@@ -69,8 +74,13 @@ Installing the following Python libraries will add optional functionality:
 .. _Argh: http://pypi.python.org/pypi/argh
 .. _GitPython: http://pypi.python.org/pypi/GitPython
 .. _Cheetah: http://pypi.python.org/pypi/Cheetah
+.. _Mako: http://www.makotemplates.org/
 .. _Genshi: http://pypi.python.org/pypi/Genshi
 .. _Sphinx: http://sphinx.pocoo.org/
+.. _pyvsphere: https://github.com/F-Secure/pyvsphere
+.. _libvirt-python: http://libvirt.org/python.html
+.. _PyDNS: http://pydns.sourceforge.net/
+.. _lxml: http://lxml.de/
 
 Installation using pip or easy_install
 --------------------------------------
@@ -96,26 +106,21 @@ Please refer to the documentation under the ``doc/`` directory
 (published at http://melor.github.com/poni/) and to the example systems under the
 ``examples/`` directory.
 
-License (MIT)
-=============
-::
+Credits
+=======
+Thanks for the contributions!
 
-  Copyright (c) 2010 Mika Eloranta
+* Oskari Saarenmaa (features)
+* Santeri Paavolainen (fixes)
+* Lakshmi Vyas (new features for AWS-EC2 support)
+* Lauri Heiskanen (enabling pseudo-tty)
+* F-Secure Corporation (major improvements, VMWare vSphere and libvirt support)
 
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
+License (Apache 2.0)
+====================
+This package is licensed under the open-source "Apache License, Version 2.0".
 
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
+The full license text is available in the file ``LICENSE`` and at
+http://www.apache.org/licenses/LICENSE-2.0.txt
 
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-  THE SOFTWARE.
+**Note:** poni versions older than 0.6 were licensed under the MIT license.

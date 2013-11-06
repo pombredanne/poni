@@ -14,7 +14,7 @@ def get_project_version(version_file):
         file_ver = None
 
     try:
-        proc = subprocess.Popen(["git", "describe"],
+        proc = subprocess.Popen(["git", "describe", "--long"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         proc.stderr.close()
@@ -30,3 +30,7 @@ def get_project_version(version_file):
                         % version_file)
 
     return file_ver
+
+if __name__ == "__main__":
+    import sys
+    get_project_version(sys.argv[1])

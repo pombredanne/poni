@@ -1,7 +1,7 @@
 """
 command-line tool
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
@@ -9,6 +9,7 @@ See LICENSE for details.
 import os
 import re
 import sys
+import itertools
 import logging
 import shlex
 import argh
@@ -30,11 +31,20 @@ from . import listout
 from . import colors
 from . import version
 from . import work
+from . import template
 from . import times
 
+try:
+    from argh import expects_obj
+except ImportError:
+    # older argh version
+    expects_obj = lambda m: m
 
-import Cheetah.Template
-from Cheetah.Template import Template as CheetahTemplate
+try:
+    from argh import named as argh_named
+except ImportError:
+    from argh import alias as argh_named
+
 
 TOOL_NAME = "poni"
 
@@ -52,19 +62,30 @@ arg_verbose = arg_flag("-v", "--verbose", help="verbose output")
 arg_quiet = arg_flag("-q", "--quiet", help="do not show remote command output")
 arg_path_prefix = argh.arg('--path-prefix', type=str, default="",
                            help='additional prefix for all deployed files')
-arg_target_nodes_0_to_n = argh.arg('nodes', type=str,
-                                   help='target nodes (regexp)', nargs="?")
-arg_target_nodes = argh.arg('nodes', type=str, help='target nodes (regexp)')
+arg_exclude_nodes = argh.arg('--exclude', type=str,
+                             metavar="PATTERN", help='exclude node pattern')
+def arg_target_nodes_0_to_n(method):
+    b = argh.arg('nodes', type=str, help='target nodes (regexp)', nargs="?")
+    return arg_exclude_nodes(b(method))
+
+def arg_target_nodes(method):
+    b = argh.arg('nodes', type=str, help='target nodes (regexp)')
+    return arg_exclude_nodes(b(method))
+
 arg_host_access_method = argh.arg("-m", "--method",
                                   choices=rcontrol_all.METHODS.keys(),
                                   help="override host access method")
 arg_output_dir = argh.arg("-o", "--output-dir", metavar="DIR", type=path,
                           help="write command output to files in DIR")
+arg_config_pattern = argh.arg("-c", "--config", metavar="PATTERN", type=str, nargs="*",
+                              help='apply to only configs matching pattern')
+arg_tag = argh.arg("-t", "--tag", metavar="TAG", type=str,
+                   help='apply to only files that are labeled with the specified tag')
 
 
 class ControlTask(work.Task):
     def __init__(self, op, args, verbose=False, method=None, quiet=False,
-                 output_dir=None, color_mode="auto"):
+                 output_dir=None, color="auto"):
         work.Task.__init__(self)
         self.op = op
         self.args = args
@@ -72,7 +93,7 @@ class ControlTask(work.Task):
         self.method = method
         self.quiet = quiet
         self.output_dir = output_dir
-        self.color_mode = color_mode
+        self.color = color
 
     def __repr__(self):
         return "%s/%s [%s]" % (self.op["node"].name, self.op["config"].name,
@@ -119,16 +140,17 @@ class ControlTask(work.Task):
                                quiet=self.quiet,
                                output_dir=self.output_dir,
                                method=self.method,
-                               color_mode=self.color_mode,
+                               color=self.color,
                                send_output=self.send_output)
             self.log.debug("op %s returns: %r", self.op["name"], ret)
             self.op["result"] = ret
-        except errors.Error, error:
+        except (SystemExit, errors.Error) as error:
+            # SystemExit is what argh produces with invalid args
             self.log.error("%s/%s [%s] failed: %s: %s" % (
                     self.op["node"].name, self.op["config"].name,
                     self.op["name"], error.__class__.__name__, error))
             self.op["result"] = "%s: %s" % (error.__class__.__name__, error)
-        except Exception, error:
+        except BaseException as error:
             self.log.error("%s/%s [%s] failed: %s: %s" % (
                     self.op["node"].name, self.op["config"].name,
                     self.op["name"], error.__class__.__name__, error))
@@ -148,22 +170,35 @@ class Tool:
         self.sky = cloud.Sky()
         self.parser = self.create_parser()
         self.task_times = times.Times()
+        self.cached_confman = None
+        self.cached_manager = None
+        self.collect_cache = {}
 
-    @argh.alias("add-system")
+    def reset_cache(self):
+        if self.cached_confman:
+            self.cached_confman.reset_cache()
+
+        self.cached_manager = None
+        self.collect_cache = {}
+
+    @expects_obj
+    @argh_named("add-system")
     @argh.arg('system', type=str, help='system name')
     def handle_add_system(self, arg):
         """add a sub-system"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         system_dir = confman.create_system(arg.system)
         self.log.debug("created: %s", system_dir)
 
-    @argh.alias("version")
+    @expects_obj
+    @argh_named("version")
     def handle_version(self, arg):
         """show version information"""
         yield version.__version__
         yield "\n"
 
-    @argh.alias("require")
+    @expects_obj
+    @argh_named("require")
     @arg_verbose
     @argh.arg("req", help="requirement expression (Python)", nargs="+")
     def handle_require(self, arg):
@@ -186,18 +221,20 @@ class Tool:
                 raise errors.RequirementError(
                     "requirement not met: %r" % req)
 
-    @argh.alias("init")
+    @expects_obj
+    @argh_named("init")
     def handle_init(self, arg):
         """init repository"""
-        confman = core.ConfigMan(arg.root_dir, must_exist=False)
+        confman = self.get_confman(arg.root_dir, must_exist=False)
         confman.init_repo()
 
-    @argh.alias("import")
+    @expects_obj
+    @argh_named("import")
     @arg_verbose
     @argh.arg('source', type=path, help='source dir/file', nargs="+")
     def handle_import(self, arg):
         """import nodes/configs"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         for glob_pattern in arg.source:
             sources = glob.glob(glob_pattern)
             if not sources:
@@ -217,14 +254,15 @@ class Tool:
         while i < len(lines):
             if lines[i][:1].isspace():
                 # needs to be catenated to previous line
-                lines[i - 1] += lines[i]
+                lines[i - 1] += "\n" + lines[i]
                 del lines[i]
             else:
                 i += 1
 
         return lines
 
-    @argh.alias("script")
+    @expects_obj
+    @argh_named("script")
     @arg_verbose
     @argh.arg('script', metavar="FILE", type=str,
               help='script file path or "-" (a single minus-sign) for stdin')
@@ -240,14 +278,11 @@ class Tool:
             raise errors.Error("%s: %s" % (error.__class__.__name__, error))
 
         variables = dict(util.parse_prop(var) for var in arg.variable)
-        try:
-            script_text = str(CheetahTemplate(script_text,
-                                              searchList=[variables]))
-        except (Cheetah.Template.Error, SyntaxError,
-                Cheetah.NameMapper.NotFound), error:
-            raise errors.Error("script error: %s: %s" % (
-                    error.__class__.__name__, error))
+        variables['current_script_dir'] = os.path.dirname(arg.script)
 
+        match = re.search(r"^\s*#\s+poni\.template\s*:\s*(\w+)", script_text, re.MULTILINE)
+        engine = match.group(1) if match else "cheetah"
+        script_text = template.render(engine=engine, source_text=script_text, vars=variables)
         lines = script_text.splitlines()
 
         def wrap(args):
@@ -288,13 +323,14 @@ class Tool:
                 self.task_times.add_task("L%d" % (i+1), line, start, stop,
                                          args=args)
 
-    @argh.alias("update-config")
+    @expects_obj
+    @argh_named("update-config")
     @arg_verbose
     @argh.arg('config', type=str, help="target config (regexp)")
     @argh.arg('source', type=path, help='source file or directory', nargs="+")
     def handle_update_config(self, arg):
         """update files to a config"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         configs = list(confman.find_config(arg.config))
         if not configs:
             raise errors.UserError("no config matching %r found" % arg.config)
@@ -309,10 +345,42 @@ class Tool:
                 elif source_path.isdir():
                     assert 0, "unimplemented"
                 else:
-                    raise errors.UserError("don't know how to handle: %r" %
-                                           str(source_path))
+                    raise errors.UserError("don't know how to handle: %r (cwd: %s)" %
+                                           (str(source_path), os.getcwd()))
 
-    @argh.alias("add-config")
+    @expects_obj
+    @argh_named("remove-config")
+    @arg_verbose
+    @arg_full_match
+    @arg_target_nodes
+    @argh.arg('config', type=str, help='name of the config')
+    @arg_flag("-e", "--skip-non-existing", help="do nothing if the config does not exist")
+    def handle_remove_config(self, arg):
+        """remove config from node(s)"""
+        alog = self.log.info if arg.verbose else self.log.debug
+        deletes = []
+        confman = self.get_confman(arg.root_dir)
+        nodes = confman.find(arg.nodes, full_match=arg.full_match, exclude=arg.exclude)
+        for node in nodes:
+            existing = list(c for c in node.iter_configs()
+                            if c.name == arg.config)
+            deletes.append("%s/%s" % (node.name, arg.config))
+            if not existing:
+                if arg.skip_non_existing:
+                    self.log.info("config '%s/%s' does not exist, skipped",
+                                  node.name, arg.config)
+                    continue
+                raise errors.UserError("config '%s/%s' does not exist"
+                                       % (node.name, arg.config))
+
+            node.remove_config(arg.config)
+            alog("removed config %r from %s", arg.config, node.path)
+
+        if not deletes and not arg.skip_non_existing:
+            raise errors.UserError("no matching nodes found")
+
+    @expects_obj
+    @argh_named("add-config")
     @arg_verbose
     @arg_full_match
     @arg_target_nodes
@@ -322,9 +390,11 @@ class Tool:
     @argh.arg("-d", "--copy-dir", metavar="DIR", type=str, default="",
               dest="copy_dir", help="copy config files from DIR")
     @arg_flag("-c", "--create-node", help="create node if it does not exist")
+    @arg_flag("-e", "--skip-existing", help="do nothing if the config already exists")
     def handle_add_config(self, arg):
         """add a config to node(s)"""
-        confman = core.ConfigMan(arg.root_dir)
+        alog = self.log.info if arg.verbose else self.log.debug
+        confman = self.get_confman(arg.root_dir)
         if arg.inherit_config:
             conf_node, conf = list(confman.get_config(arg.inherit_config))
             parent_config_name = "%s/%s" % (conf_node.name, conf.name)
@@ -334,33 +404,37 @@ class Tool:
             parent_config_name = None
 
         updates = []
-        nodes = list(confman.find(arg.nodes, full_match=arg.full_match))
+        nodes = list(confman.find(arg.nodes, full_match=arg.full_match,
+                                  exclude=arg.exclude))
         if arg.create_node and (not nodes):
             # node does not exist, create it as requested
             confman.create_node(arg.nodes)
-            nodes = confman.find(arg.nodes, full_match=True)
+            nodes = confman.find(arg.nodes, full_match=True,
+                                 exclude=arg.exclude)
 
         for node in nodes:
             existing = list(c for c in node.iter_configs()
                             if c.name == arg.config)
+            updates.append("%s/%s" % (node.name, arg.config))
             if existing:
-                raise errors.UserError("config '%s/%s' already exists" % (
-                        node.name, arg.config))
+                if arg.skip_existing:
+                    self.log.info("config '%s/%s' already exists, skipped",
+                                  node.name, arg.config)
+                    continue
+                else:
+                    raise errors.UserError("config '%s/%s' already exists" % (
+                            node.name, arg.config))
 
             node.add_config(arg.config, parent=parent_config_name,
                             copy_dir=arg.copy_dir)
-            # TODO: verbose output
-            self.log.debug("added config %r to %s, parent=%r", arg.config,
-                           node.path, parent_config_name)
-            updates.append("%s/%s" % (node.name, arg.config))
+            alog("added config %r to %s, parent=%r",
+                 arg.config, node.path, parent_config_name)
 
         if not updates:
             raise errors.UserError("no matching nodes found")
-        elif arg.verbose:
-            self.log.info("config %r added to: %s", arg.config,
-                          ", ".join(updates))
 
-    @argh.alias("add-library")
+    @expects_obj
+    @argh_named("add-library")
     @arg_verbose
     @arg_full_match
     @argh.arg('-c', '--config', type=str, help='config search pattern')
@@ -368,7 +442,7 @@ class Tool:
     @argh.arg('path', type=path, help='library path within config')
     def handle_add_library(self, arg):
         """add a Python library from a config to PYTHONPATH"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
 
         if arg.config:
             # path is relative to a config
@@ -403,10 +477,13 @@ class Tool:
         logger = self.log.info if arg.verbose else self.log.debug
         logger("library %r path set: %s", arg.name, str(store_path))
 
-    @argh.alias("control")
+    @expects_obj
+    @argh_named("control")
     @arg_verbose
     @arg_full_match
     @arg_flag("-n", "--no-deps", help="do not run dependency tasks")
+    @arg_flag("-i", "--ignore-missing",
+              help="do not fail in case no matching operations are found")
     @arg_quiet
     @arg_output_dir
     @arg_flag("-t", "--clock-tasks", dest="show_times",
@@ -418,8 +495,8 @@ class Tool:
     @argh.arg('operation', type=str, help='operation to execute')
     def handle_control(self, arg):
         """config control operation"""
-        confman = core.ConfigMan(arg.root_dir)
-        manager = config.Manager(confman)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
+        manager = self.get_manager(confman)
         self.collect_all(manager)
 
         # collect all possible control operations
@@ -445,7 +522,14 @@ class Tool:
                     ops = provider.setdefault(feature, [])
                     ops.append(op)
 
+        handled = set()
+
         def add_all_required_ops(op):
+            key = (op["node"].name, op["config"].name, op["name"])
+            if key in handled:
+                return
+            handled.add(key)
+
             node = op["node"]
             conf = op["config"]
             tasks[(node.name, conf.name, op["name"])] = op
@@ -483,11 +567,15 @@ class Tool:
                 or not comparison.match_config(conf.name)):
                 continue
 
-            op["run"] = True # only explicit targets are marked for running
+            op["run"] = True  # only explicit targets are marked for running
             add_all_required_ops(op)
 
         if not tasks:
-            raise errors.UserError("no matching operations found")
+            if arg.ignore_missing:
+                self.log.info("no matching operations found: --ignore-missing specified, ok!")
+                return
+            else:
+                raise errors.UserError("no matching operations found")
 
         if arg.no_deps:
             # filter out the implicit dependency tasks
@@ -511,7 +599,7 @@ class Tool:
                    op["config"].name, op["name"])
             task = ControlTask(op, arg.extras, verbose=arg.verbose,
                                quiet=arg.quiet, output_dir=arg.output_dir,
-                               method=arg.method, color_mode=arg.color_mode)
+                               method=arg.method, color=arg.color)
             runner.add_task(task)
 
         # execute tasks
@@ -550,7 +638,8 @@ class Tool:
                 "all [%d] control tasks finished successfully (%d skipped)" % (
                     ran_count, skipped_count))
 
-    @argh.alias("exec")
+    @expects_obj
+    @argh_named("exec")
     @arg_verbose
     @arg_quiet
     @arg_output_dir
@@ -560,42 +649,45 @@ class Tool:
     @argh.arg('cmd', type=str, help='command to execute')
     def handle_remote_exec(self, arg):
         """run a shell-command"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         def rexec(arg, node, remote):
-            color = colors.Output(sys.stdout, color=arg.color_mode).color
+            color = colors.Output(sys.stdout, color=arg.color).color
             if arg.output_dir:
                 output_file_path = arg.output_dir / ("%s.log" % node.name.replace("/", "_"))
                 output_file = output_file_path.open("wt")
             else:
                 output_file = None
 
-            return remote.execute(arg.cmd, verbose=arg.verbose, color=color, quiet=arg.quiet,
+            return remote.execute(arg.cmd, verbose=arg.verbose, color=color,
+                                  quiet=arg.quiet,
                                   output_file=output_file)
 
         rexec.doc = "exec: %r" % arg.cmd
-        result = self.remote_op(confman, arg, rexec)
+        result = self.remote_op(confman, arg, rexec, exclude=arg.exclude)
         if result:
             raise errors.RemoteError("remote exec failed with code: %r" % (
                     result,))
 
-    @argh.alias("shell")
+    @expects_obj
+    @argh_named("shell")
     @arg_verbose
     @arg_full_match
     @arg_host_access_method
     @arg_target_nodes
     def handle_remote_shell(self, arg):
         """start an interactive shell session"""
-        confman = core.ConfigMan(arg.root_dir)
-        color = colors.Output(sys.stdout, color=arg.color_mode).color
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
+        color = colors.Output(sys.stdout, color=arg.color).color
         def rshell(arg, node, remote):
             remote.shell(verbose=arg.verbose, color=color)
 
         rshell.doc = "shell"
         self.remote_op(confman, arg, rshell)
 
-    def remote_op(self, confman, arg, op):
+    def remote_op(self, confman, arg, op, exclude=None):
         ret = 0
-        nodes = list(confman.find(arg.nodes, full_match=arg.full_match))
+        nodes = list(confman.find(arg.nodes, full_match=arg.full_match,
+                                  exclude=exclude))
         if not nodes:
             raise errors.UserError("%r does not match any nodes" % (arg.nodes))
 
@@ -617,10 +709,11 @@ class Tool:
 
         return ret
 
-    @argh.alias("init")
+    @expects_obj
+    @argh_named("init")
     def handle_vc_init(self, arg):
         """init version control in repo"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         if confman.vc:
             raise errors.UserError(
                 "version control already initialized in this repo")
@@ -632,45 +725,54 @@ class Tool:
             raise errors.UserError(
                 "version control not initialized in this repo")
 
-    @argh.alias("diff")
+    @expects_obj
+    @argh_named("diff")
     def handle_vc_diff(self, arg):
         """show repository working status diff"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         self.require_vc(confman)
         for out in confman.vc.status():
             print out,
 
-    @argh.alias("checkpoint")
+    @expects_obj
+    @argh_named("checkpoint")
     @argh.arg('message', type=str, help='commit message')
     def handle_vc_checkpoint(self, arg):
         """commit all locally added and changed files in the repository"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         self.require_vc(confman)
         confman.vc.commit_all(arg.message)
 
-    @argh.alias("terminate")
+    @expects_obj
+    @argh_named("terminate")
     @arg_full_match
     @argh.arg('target', type=str, help='target systems/nodes (regexp)')
     def handle_cloud_terminate(self, arg):
         """terminate cloud instances"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         count = 0
+        # group operations by provider
+        clouds = {}
         for node in confman.find(arg.target, full_match=arg.full_match):
             cloud_prop = node.get("cloud", {})
             if cloud_prop.get("instance"):
                 provider = self.sky.get_provider(cloud_prop)
-                provider.terminate_instances([cloud_prop])
-                self.log.info("terminated: %s", node.name)
-                count += 1
-
+                if provider not in clouds:
+                    clouds[provider] = []
+                clouds[provider].append(cloud_prop)
+                self.log.info("terminating: %s", node.name)
+        for provider, props in clouds.iteritems():
+            provider.terminate_instances(props)
+            count += len(props)
         self.log.info("%s instances terminated", count)
 
-    @argh.alias("update")
+    @expects_obj
+    @argh_named("update")
     @arg_full_match
     @argh.arg('target', type=str, help='target systems/nodes (regexp)')
     def handle_cloud_update(self, arg):
         """update node cloud instance properties"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         for node in confman.find(arg.target, full_match=arg.full_match):
             cloud_prop = node.get("cloud", {})
             if not cloud_prop.get("instance"):
@@ -693,25 +795,41 @@ class Tool:
                 self.log.info("%s: updated: %s", node.name, change_str)
                 node.save()
 
-    @argh.alias("wait")
+    @expects_obj
+    @argh_named("wait")
     @arg_full_match
     @argh.arg('target', type=str, help='target systems/nodes (regexp)')
     @argh.arg('--state', type=str, default="running",
               help="target instance state, default: 'running'")
     def handle_cloud_wait(self, arg):
         """wait cloud instances to reach a specific running state"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         return self.cloud_op(confman, arg, False)
 
-    @argh.alias("init")
+    @expects_obj
+    @argh_named("init")
     @arg_full_match
     @argh.arg("target", type=str, help="target systems/nodes (regexp)")
     @arg_flag("--reinit", dest="reinit", help="re-initialize cloud image")
     @arg_flag("--wait", dest="wait", help="wait for instance to start")
     def handle_cloud_init(self, arg):
         """reserve and start a cloud instance for nodes"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         return self.cloud_op(confman, arg, True)
+
+    @expects_obj
+    @argh_named("ip")
+    @arg_full_match
+    @argh.arg("target", type=str, help="target systems/nodes (regexp)")
+    def handle_cloud_ip(self, arg):
+        """assign ips to instances based on properties"""
+        confman = core.ConfigMan(arg.root_dir)
+        props = [node["cloud"]
+                    for node in confman.find(arg.target,
+                                    full_match=arg.full_match)
+                    if node.get("cloud", None)]
+        for provider, props in itertools.groupby(props, self.sky.get_provider):
+            provider.assign_ip(props)
 
     def cloud_op(self, confman, arg, start):
         nodes = []
@@ -762,17 +880,89 @@ class Tool:
                 updates = provider.wait_instances(props, wait_state=wait_state)
 
                 for node in nodes:
-                    node_update = updates[node["cloud"]["instance"]]
+                    instance_id = node.get("cloud", {}).get("instance")
+                    if not instance_id:
+                        raise errors.CloudError(
+                            "cloud provider failed to set the 'instance' property for node '{0}'".format(
+                                node.name))
 
-                    changes = node.log_update(node_update)
+                    update = updates.get(instance_id)
+
+                    self.log.info("Check node: %s (id:%s) (upd:%s)", node, instance_id, update)
+                    if not update:
+                        raise errors.CloudError(
+                            "cloud provider failed to return updated properties for node '{0}' (id:{1})".format(
+                                node.name, instance_id))
+
+                    changes = node.log_update(update)
                     if changes:
                         change_str = ", ".join(
                             ("%s=%r (from %r)" % (c[0], c[2], c[1]))
                             for c in changes)
-                        self.log.info("%s: updated: %s", node.name, change_str)
+                        self.log.info("%s: set: %s", node.name, change_str)
                         node.save()
 
-    @argh.alias("set")
+    def _get_cloud_hosts_from_args(self, arg):
+        confman = core.ConfigMan(arg.root_dir)
+        props = [node["cloud"] for node in confman.find(arg.nodes, full_match=arg.full_match)
+                 if node.get("cloud", None)]
+        if not props:
+            raise errors.UserError("%r does not match any nodes" % (arg.nodes))
+        for provider, props in itertools.groupby(props, lambda prop: self.sky.get_provider(prop)):
+            yield provider, props
+
+    @expects_obj
+    @argh_named("create-snapshot")
+    @arg_full_match
+    @arg_target_nodes
+    @argh.arg("name", type=str, help="snapshot name")
+    @argh.arg("--description", type=str, dest="description", default="", help="optional description of the snapshot")
+    @arg_flag("--memory", dest="memory", help="include memory in the snapshot")
+    def handle_cloud_create_snapshot(self, arg):
+        """create a named snapshot for nodes"""
+        for provider, props in self._get_cloud_hosts_from_args(arg):
+            provider.create_snapshot(props, name=arg.name, description=arg.description, memory=arg.memory)
+
+    @expects_obj
+    @argh_named("revert-to-snapshot")
+    @arg_full_match
+    @arg_target_nodes
+    @argh.arg("name", type=str, help="snapshot name")
+    def handle_cloud_revert_to_snapshot(self, arg):
+        """revert the nodes to a named snapshot"""
+        for provider, props in self._get_cloud_hosts_from_args(arg):
+            provider.revert_to_snapshot(props, name=arg.name)
+
+    @expects_obj
+    @argh_named("remove-snapshot")
+    @arg_full_match
+    @arg_target_nodes
+    @argh.arg("name", type=str, help="snapshot name")
+    def handle_cloud_remove_snapshot(self, arg):
+        """remove a named snapshot from nodes"""
+        for provider, props in self._get_cloud_hosts_from_args(arg):
+            provider.remove_snapshot(props, name=arg.name)
+
+    @expects_obj
+    @argh_named("power-off")
+    @arg_full_match
+    @arg_target_nodes
+    def handle_cloud_power_off(self, arg):
+        """Power off nodes"""
+        for provider, props in self._get_cloud_hosts_from_args(arg):
+            provider.power_off_instances(props)
+
+    @expects_obj
+    @argh_named("power-on")
+    @arg_full_match
+    @arg_target_nodes
+    def handle_cloud_power_on(self, arg):
+        """Power on nodes"""
+        for provider, props in self._get_cloud_hosts_from_args(arg):
+            provider.power_on_instances(props)
+
+    @expects_obj
+    @argh_named("set")
     @arg_verbose
     @arg_full_match
     @arg_nodes_only
@@ -781,7 +971,7 @@ class Tool:
     @argh.arg('property', type=str, nargs="+", help="'name=[type:]value'")
     def handle_set(self, arg):
         """set system/node properties"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         logger = logging.info if arg.verbose else logging.debug
         changed_items = []
         found = False
@@ -830,6 +1020,10 @@ class Tool:
             item.save()
 
     def collect_all(self, manager):
+        items = self.collect_cache.get(manager)
+        if items:
+            return items
+
         items = []
         for item in manager.confman.find("."):
             item.collect(manager)
@@ -840,27 +1034,39 @@ class Tool:
         for item in items:
             item.collect_parents(manager)
 
+        self.collect_cache[manager] = items
+
         return items
 
-    def verify_op(self, confman, target, full_match=False, **verify_options):
-        manager = config.Manager(confman)
+    def verify_op(self, confman, target, full_match=False, exclude=None,
+                  **verify_options):
+        manager = self.get_manager(confman)
         self.collect_all(manager)
+        self.log.debug("verify_op %r: confman cache=%r, manager files=%r, buckets=%r",
+                       target, confman.dump_stats(), len(manager.files), dict((k, len(v)) for k, v in manager.buckets.iteritems()))
 
         if target:
+            if exclude:
+                exclude = re.compile(exclude).search
+            else:
+                exclude = lambda name: False
+
             if full_match:
                 search_op = re.compile(target + "$").match
             else:
                 search_op = re.compile(target).search
 
             def target_filter(item):
-                return search_op(item["node"].name)
+                return (search_op(item["node"].name)
+                        and not exclude(item["node"].name))
         else:
             target_filter = lambda item: True
 
         stats = manager.verify(callback=target_filter, **verify_options)
         return manager, stats
 
-    @argh.alias("show")
+    @expects_obj
+    @argh_named("show")
     @arg_verbose
     @arg_full_match
     @arg_target_nodes_0_to_n
@@ -869,20 +1075,25 @@ class Tool:
     @arg_flag("--raw", dest="show_raw", help="show raw templates")
     @arg_flag("-d", "--diff", dest="show_diff",
               help="show raw template vs. rendered output diff")
+    @arg_config_pattern
+    @arg_tag
     def handle_show(self, arg):
         """render and show node config files"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         manager, stats = self.verify_op(
             confman, arg.nodes, show=(not arg.show_buckets),
             full_match=arg.full_match, raw=arg.show_raw,
-            color_mode=arg.color_mode, show_diff=arg.show_diff)
+            color=arg.color, show_diff=arg.show_diff,
+            exclude=arg.exclude, config_patterns=arg.config,
+            tag=arg.tag)
 
         if arg.show_buckets:
             for name, items in manager.buckets.iteritems():
                 for i, item in enumerate(items):
                     print "%s #%d: %r" % (name, i, item)
 
-    @argh.alias("report")
+    @expects_obj
+    @argh_named("report")
     @argh.arg("-o", "--output-file", metavar="FILE", type=path, nargs="?",
               help='output file path (default: stdout)')
     def handle_report(self, arg):
@@ -891,19 +1102,23 @@ class Tool:
         for chunk in self.task_times.iter_report():
             out.write(chunk)
 
-    @argh.alias("deploy")
+    @expects_obj
+    @argh_named("deploy")
     @arg_verbose
     @arg_full_match
     @arg_path_prefix
     @arg_target_nodes_0_to_n
     @arg_host_access_method
+    @arg_config_pattern
+    @arg_tag
     def handle_deploy(self, arg):
         """deploy node configs"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         manager, stats = self.verify_op(
             confman, arg.nodes, show=False, deploy=True, verbose=arg.verbose,
             full_match=arg.full_match, path_prefix=arg.path_prefix,
-            access_method=arg.method, color_mode=arg.color_mode)
+            access_method=arg.method, color=arg.color,
+            exclude=arg.exclude, config_patterns=arg.config, tag=arg.tag)
         if stats.error_count:
             raise errors.VerifyError("failed: files with errors: [%d/%d]" % (
                            stats.error_count, stats.file_count))
@@ -912,21 +1127,25 @@ class Tool:
         else:
             self.log.info("all [%d] files ok", stats.file_count)
 
-    @argh.alias("audit")
+    @expects_obj
+    @argh_named("audit")
     @arg_verbose
     @arg_full_match
     @arg_path_prefix
     @arg_target_nodes_0_to_n
     @arg_host_access_method
     @arg_flag("-d", "--diff", dest="show_diff", help="show config diffs")
+    @arg_config_pattern
+    @arg_tag
     def handle_audit(self, arg):
         """audit active node configs"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         manager, stats = self.verify_op(
             confman, arg.nodes, show=False, deploy=False, audit=True,
             show_diff=arg.show_diff, full_match=arg.full_match,
             path_prefix=arg.path_prefix, access_method=arg.method,
-            color_mode=arg.color_mode, verbose=arg.verbose)
+            color=arg.color, verbose=arg.verbose,
+            exclude=arg.exclude, config_patterns=arg.config, tag=arg.tag)
 
         if stats.error_count:
             raise errors.VerifyError("failed: files with errors: [%d/%d]" % (
@@ -936,18 +1155,22 @@ class Tool:
         else:
             self.log.info("all [%d] files ok", stats.file_count)
 
-    @argh.alias("verify")
+    @expects_obj
+    @argh_named("verify")
     @arg_verbose
     @arg_full_match
     @arg_host_access_method
+    @arg_config_pattern
+    @arg_tag
     @arg_target_nodes_0_to_n
     def handle_verify(self, arg):
         """verify local node configs"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         manager, stats = self.verify_op(
             confman, arg.nodes, show=False, full_match=arg.full_match,
             access_method=arg.method, verbose=arg.verbose,
-            color_mode=arg.color_mode)
+            color=arg.color, exclude=arg.exclude, config_patterns=arg.config,
+            tag=arg.tag)
 
         if stats.error_count:
             raise errors.VerifyError("failed: files with errors: [%d/%d]" % (
@@ -957,7 +1180,8 @@ class Tool:
         else:
             self.log.info("all [%d] files ok", stats.file_count)
 
-    @argh.alias("add-node")
+    @expects_obj
+    @argh_named("add-node")
     @arg_verbose
     @arg_full_match
     @argh.arg('node', type=str,
@@ -971,7 +1195,7 @@ class Tool:
     @arg_flag("-c", "--copy-props", help="copy parent node's properties")
     def handle_add_node(self, arg):
         """add a new node"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         if arg.inherit_node:
             nodes = list(confman.find(arg.inherit_node,
                                       full_match=arg.full_match))
@@ -1007,9 +1231,11 @@ class Tool:
 
             logger("node added: %s%s", node_name, msg)
 
-    @argh.alias("list")
+    @expects_obj
+    @argh_named("list")
     @arg_full_match
     @argh.arg('pattern', type=str, help='search pattern', nargs="?")
+    @arg_exclude_nodes
     @arg_flag("-n", "--nodes", dest="show_nodes", help="show nodes")
     @arg_flag("-s", "--systems", dest="show_systems", help="show systems")
     @arg_flag("-c", "--config", dest="show_config", help="show node configs")
@@ -1029,36 +1255,57 @@ class Tool:
               help="one line per property")
     def handle_list(self, arg):
         """list systems and nodes"""
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
 
-        manager = config.Manager(confman)
+        manager = self.get_manager(confman)
         self.collect_all(manager) # TODO: needed by "list -C"
 
         list_output = listout.ListOutput(self, confman, **arg.__dict__)
         for output in list_output.output():
             yield output
 
-    @argh.alias("list")
+    def get_confman(self, root_dir, must_exist=True, reset_cache=True):
+        if reset_cache:
+            self.reset_cache()
+
+        if not self.cached_confman:
+            self.cached_confman = core.ConfigMan(root_dir, must_exist=must_exist)
+
+        return self.cached_confman
+
+    def get_manager(self, confman):
+        if self.cached_manager:
+            #self.cached_manager.reset()
+            pass
+        else:
+            self.cached_manager = config.Manager(confman)
+
+        return self.cached_manager
+
+
+    @expects_obj
+    @argh_named("list")
     @arg_full_match
     @arg_flag("-l", "--show-layers", help="show settings layers")
     @argh.arg('pattern', type=str, help='node search pattern', nargs="?")
     def handle_settings_list(self, arg):
         """list settings"""
         pattern = arg.pattern or "."
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir, reset_cache=False)
         list_output = listout.ListOutput(self, confman, show_settings=True,
                                          show_config=True, **arg.__dict__)
         for output in list_output.output():
             yield output
 
-    @argh.alias("set")
+    @expects_obj
+    @argh_named("set")
     @arg_full_match
-    @argh.arg('pattern', type=str, help='search pattern', nargs="?")
+    @argh.arg('pattern', type=str, help='search pattern')
     @argh.arg('setting', type=str, nargs="+", help="'name=[type:]value'")
     def handle_settings_set(self, arg):
         """override settings values"""
         pattern = arg.pattern or "."
-        confman = core.ConfigMan(arg.root_dir)
+        confman = self.get_confman(arg.root_dir)
         configs = list(confman.find_config(arg.pattern, all_configs=True,
                                            full_match=arg.full_match))
         if not configs:
@@ -1129,20 +1376,21 @@ class Tool:
                             help="time-log this operation as NAME")
         parser.add_argument(
             "-d", "--root-dir", dest="root_dir", default=default_root,
+            type=lambda rel_path: os.path.abspath(rel_path),
             metavar="DIR",
             help="repository root directory (default: $HOME/.poni/default)")
         parser.add_argument(
-            "-c", "--color", dest="color_mode", default="auto",
+            "-c", "--color", default="auto",
             choices=["on", "off", "auto"], help="use color highlighting")
 
         commands = [
             self.handle_list, self.handle_add_system, self.handle_init,
             self.handle_import, self.handle_script, self.handle_add_config,
-            self.handle_update_config, self.handle_version,
+            self.handle_update_config, self.handle_remove_config,
             self.handle_control, self.handle_require, self.handle_add_library,
             self.handle_set, self.handle_show, self.handle_deploy,
             self.handle_audit, self.handle_verify, self.handle_add_node,
-            self.handle_report,
+            self.handle_report, self.handle_version,
             ]
         commands.sort(key=lambda func: func.__name__)
         parser.add_commands(commands)
@@ -1150,6 +1398,12 @@ class Tool:
         parser.add_commands([
                 self.handle_cloud_init, self.handle_cloud_terminate,
                 self.handle_cloud_update, self.handle_cloud_wait,
+                self.handle_cloud_ip,
+                self.handle_cloud_create_snapshot,
+                self.handle_cloud_revert_to_snapshot,
+                self.handle_cloud_remove_snapshot,
+                self.handle_cloud_power_off,
+                self.handle_cloud_power_on,
                 ],
                             namespace="cloud", title="cloud operations",
                             help="command to execute")

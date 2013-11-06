@@ -1,7 +1,7 @@
 """
 error types
 
-Copyright (c) 2010-2011 Mika Eloranta
+Copyright (c) 2010-2012 Mika Eloranta
 See LICENSE for details.
 
 """
@@ -26,6 +26,9 @@ class SettingsError(Error):
 
 class VerifyError(Error):
     """verify error"""
+
+class TemplateError(Error):
+    """template rendering error"""
 
 class CloudError(Error):
     """cloud error"""

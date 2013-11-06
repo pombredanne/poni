@@ -1,3 +1,11 @@
+"""
+parallel task management
+
+Copyright (c) 2010-2012 Mika Eloranta
+See LICENSE for details.
+
+"""
+
 import time
 import logging
 import threading
@@ -60,9 +68,9 @@ class Runner:
         try:
             task = self.finished_queue.get(timeout=60.0)
         except queue.Empty:
-            started = self.started
-            self.log.warning("task wait timeout: started=%r, not_started=%r",
-                             self.started, self.not_started)
+            self.log.warning(
+                "tasks taking long to finish: %s and %r tasks waiting to be started",
+                ", ".join(str(task) for task in self.started), len(self.not_started))
             return
 
         self.log.debug("task %s finished, took %.2f seconds", task,
@@ -75,4 +83,3 @@ class Runner:
         while self.not_started or self.started:
             self.check()
             self.wait_task_to_finish()
-

@@ -15,7 +15,6 @@ long_desc = file("%s/README.rst" % new_dir).read()
 depends = [
     "path.py>=2.2.2",
     "paramiko>=1.7.6",
-    "cheetah>=2.4.2",
     "GitPython>=0.3.1",
     "argh>=0.13",
     ]
@@ -42,7 +41,7 @@ setup(
     classifiers = [
         "Programming Language :: Python",
         "Development Status :: 4 - Beta",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Apache Software License",
         "Intended Audience :: Developers",
         "Intended Audience :: System Administrators",
         "Operating System :: OS Independent",
